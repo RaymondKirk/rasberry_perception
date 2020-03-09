@@ -9,10 +9,8 @@ find_package(catkin REQUIRED COMPONENTS
   rospy
   std_msgs
   sensor_msgs
-  realsense2_camera
   ros_numpy
   message_generation
-  dynamic_reconfigure
 )
 
 # ==============================================
@@ -29,13 +27,13 @@ add_service_files(
 )
 
 add_message_files(
-  FILES
-  BoundingBox.msg
-  BoundingBox3D.msg
-  HarvestDetections.msg
-  ImageDetections.msg
-  SegmentationLabel.msg
-  SegmentationLabel3D.msg
+    FILES
+    Detection.msg
+    DetectionInfo.msg
+    Detections.msg
+    DetectionStatus.msg
+    RegionOfInterest.msg
+    SegmentOfInterest.msg
 )
 
 generate_messages(DEPENDENCIES std_msgs sensor_msgs rasberry_perception)
