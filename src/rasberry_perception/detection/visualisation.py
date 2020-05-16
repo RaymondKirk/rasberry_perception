@@ -100,11 +100,11 @@ class Visualiser:
         assigned_colors = None
         alpha = 0.5
 
-        for detection in message.detections.detections:
+        for detection in message.objects:
             boxes.append([detection.roi.x1, detection.roi.y1, detection.roi.x2, detection.roi.y2])
             xyxy_abs = list(zip(detection.seg_roi.x, detection.seg_roi.y))
             masks.append(GenericMask([xyxy_abs], self.height, self.width))
-            labels.append("{} {:.2f}".format(detection.info.class_name, detection.info.score))
+            labels.append("{} {:.2f}".format(detection.class_name, detection.confidence))
 
         self.overlay_instances(boxes, labels, masks, assigned_colors, alpha)
 

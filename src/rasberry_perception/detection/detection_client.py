@@ -7,69 +7,88 @@
 
 from __future__ import absolute_import, division, print_function
 
+from collections import defaultdict
+
 import message_filters
 import numpy as np
 import ros_numpy
 import rospy
-from geometry_msgs.msg import Point, PoseArray, Pose
+from geometry_msgs.msg import Point, Pose, Quaternion, PoseArray
+from rasberry_perception.msg._TaggedPose import TaggedPose
 from sensor_msgs.msg import Image, CameraInfo
 
 from rasberry_perception.detection import Client, default_service_name
 from rasberry_perception.detection.utility import function_timer, WorkerTaskQueue
 from rasberry_perception.detection.visualisation import Visualiser
-from rasberry_perception.msg import Detections, Detection, RegionOfInterest, SegmentOfInterest, DetectionInfo
+from rasberry_perception.msg import Detections, Detection, RegionOfInterest, SegmentOfInterest, TaggedPoseStampedArray
 
 
 class RunClientOnTopic:
     def __init__(self, image_namespace, depth_namespace=None, score_thresh=0.5, service_name=default_service_name,
-            vis=False):
-        self._service_name = service_name
-        stem = image_namespace.split('/')[-1]
-
-        self.namespace = "rasberry_perception/" + stem + "/"
-
+                 visualisation_enabled=False):
+        # Initialise class members
         self.score_thresh = score_thresh
+        self._service_name = service_name
+        self.namespace = "rasberry_perception/"
+        self.depth_enabled = depth_namespace is not None
+        self.visualisation_enabled = visualisation_enabled
 
         # Wait for connection to detection service
         self.detector = Client()
-        self.vis = vis
-        if self.vis:
-            # Discard frame if worker busy
-            self.publisher_tasks = WorkerTaskQueue(num_workers=1, max_size=1, discard=True)
-            rospy.on_shutdown(self.on_shutdown)
 
-        # Initialise publishers
-        self.detections_pub = rospy.Publisher(self.namespace + "detections", Detections, queue_size=1)
+        # Initialise colour publishers/subscribers
+        # These topics will republish the colour image (to ensure a 1:1 detection/source lookup)
         self.image_pub = rospy.Publisher(self.namespace + "colour/image_raw", Image, queue_size=1)
         self.image_info_pub = rospy.Publisher(self.namespace + "colour/camera_info", CameraInfo, queue_size=1)
-        self.detections_vis_pub = rospy.Publisher(self.namespace + "colour/vis_raw", Image, queue_size=1)
 
-        # Initialise subscribers
         subscribers = [
             message_filters.Subscriber(image_namespace + "/image_raw", Image),
             message_filters.Subscriber(image_namespace + "/camera_info", CameraInfo),
         ]
 
-        self.depth_enabled = depth_namespace is not None
+        # The detector results publisher
+        self.detection_results_pub = rospy.Publisher(self.namespace + "results", Detections, queue_size=1)
+
+        # Initialise depth publishers/subscribers
         if self.depth_enabled:
+            # These topics will republish the depth image (to ensure a 1:1 detection/source lookup)
             self.depth_pub = rospy.Publisher(self.namespace + "depth/image_raw", Image, queue_size=1)
             self.depth_info_pub = rospy.Publisher(self.namespace + "depth/camera_info", CameraInfo, queue_size=1)
-            self.depth_bbox_detections_pub = rospy.Publisher(self.namespace + "bbox_detections", PoseArray,
-                                                             queue_size=1)
-            self.depth_segm_detections_pub = rospy.Publisher(self.namespace + "segm_detections", PoseArray,
-                                                             queue_size=1)
 
+            # Container for /detection/<class name>/bbox_poses and /detection/<class name>/segm_poses messages
+            self.depth_pose_publishers = {}
+
+            # Publish as tagged (by class name)
+            self.tagged_bbox_pose_publisher = rospy.Publisher(self.namespace + "poses/bbox",
+                                                              TaggedPoseStampedArray, queue_size=1)
+            self.tagged_segm_pose_publisher = rospy.Publisher(self.namespace + "poses/segm",
+                                                              TaggedPoseStampedArray, queue_size=1)
+
+            # Subscribe to depth and depth intrinsic topics
             subscribers.extend([
                 message_filters.Subscriber(depth_namespace + "/image_raw", Image),
                 message_filters.Subscriber(depth_namespace + "/camera_info", CameraInfo),
             ])
 
-        # Start subscription
+        if self.visualisation_enabled:
+            # Draw the detection message visually
+            self.detections_vis_pub = rospy.Publisher(self.namespace + "vis/detection/image_raw", Image, queue_size=1)
+
+            # Worker thread to do the heavy lifting of the detections visualisation
+            self.publisher_tasks = WorkerTaskQueue(num_workers=1, max_size=1, discard=True)
+            rospy.on_shutdown(self.on_shutdown)
+
+            # This topic only publishes the points of the depth map that are considered for the bbox_pose calculation
+            if self.depth_enabled:
+                self.box_depth_pub = rospy.Publisher(self.namespace + "vis/bbox_points/image_raw", Image, queue_size=1)
+                self.box_depth_info_pub = rospy.Publisher(self.namespace + "vis/bbox_points/camera_info", CameraInfo, queue_size=1)
+
+        # Start subscription to the relevant topics
         sync_queue, sync_thresh = 1, 0.1
         rospy.loginfo("Waiting for topics with time synchroniser (queue {}, {}s tolerance) on '{}'".format(
             sync_queue, sync_thresh, ', '.join([s.topic for s in subscribers])
         ))
-        self.ts = message_filters.ApproximateTimeSynchronizer(subscribers, 1, 0.1)
+        self.ts = message_filters.ApproximateTimeSynchronizer(subscribers, sync_queue, sync_thresh, allow_headerless=True)
         self.ts.registerCallback(self.run_detector)
 
     def on_shutdown(self):
@@ -84,10 +103,39 @@ class RunClientOnTopic:
         if not result.status.OKAY:
             return
 
-        self.publish_detections(*args, result=result)
+        self.publish_detections(*args, response=result)
+
+    def _publish_poses(self, poses, tagged_bbox_poses, tagged_segm_poses):
+        """Creates a separate PoseArray publisher for each detected class and pose_origin and as a pose tagged
+
+        Args:
+            poses (Dict[str: PoseArray]): [Class Name][Origin] to PoseArray lookup of poses
+        """
+        if not self.depth_enabled:
+            return
+
+        if len(tagged_bbox_poses.poses):
+            self.tagged_bbox_pose_publisher.publish(tagged_bbox_poses)
+        if len(tagged_segm_poses.poses):
+            self.tagged_segm_pose_publisher.publish(tagged_segm_poses)
+
+        for class_name, origin_dict in poses.items():
+            for origin, pose_array in origin_dict.items():
+                topic = self.namespace + "poses/by_class/{}/{}".format(class_name.replace(" ", "_"), origin)
+                if topic not in self.depth_pose_publishers:
+                    self.depth_pose_publishers[topic] = rospy.Publisher(topic, PoseArray, queue_size=1)
+                self.depth_pose_publishers[topic].publish(pose_array)
+
+    @staticmethod
+    def _get_pose(depth_roi, valid_positions, x_offset, y_offset, _fx, _fy, _cx, _cy):
+        """Utility function to get a pose from a set of (y, x) points within a depth map"""
+        zp = depth_roi[valid_positions] / 1000.0
+        yp = ((valid_positions[0] + y_offset) - _cy) * zp / _fy
+        xp = ((valid_positions[1] + x_offset) - _cx) * zp / _fx
+        return Pose(position=Point(np.median(xp), np.median(yp), np.median(zp)), orientation=Quaternion(0, 0, 0, 1))
 
     @function_timer.interval_logger(interval=10)
-    def publish_detections(self, image_msg, image_info, depth_msg, depth_info, result):
+    def publish_detections(self, image_msg, image_info, depth_msg, depth_info, response):
         """Function to publish detections based on the image data and detector result
 
         Args:
@@ -95,64 +143,90 @@ class RunClientOnTopic:
             image_info (CameraInfo): The RGB camera info message
             depth_msg (Image): The aligned depth to image_msg message
             depth_info (CameraInfo):  The depth camera info message
-            result (GetDetectorResultsResponse):  The result of a call to the GetDetectorResults service api
+            response (GetDetectorResultsResponse):  The result of a call to the GetDetectorResults service api
         """
-        result.detections.detections = [d for d in result.detections.detections if d.info.score >= 0]
-        result.detections.detections.extend(self._get_test_messages(depth_msg.height, depth_msg.width))
-        detections = result.detections.detections
+        # Filter detections by the score
+        results = Detections(camera_frame=image_msg, camera_info=image_info)
+        results.objects = [d for d in response.results.objects if d.confidence >= self.score_thresh]
+        for o in results.objects:
+            o.track_id = -1  # Signify this is not a tracked object
 
+        # Uncomment this line for dummy detections
+        # results.objects.extend(self._get_test_messages(depth_msg.height, depth_msg.width))
 
-        if not len(detections):
+        if not len(results.objects):
             return
 
         if self.depth_enabled and depth_msg is not None:
             depth_image = ros_numpy.numpify(depth_msg)
+            boxes_depth_image = np.zeros_like(depth_image)
 
             fx, fy, cx, cy = depth_info.P[0], depth_info.P[5], depth_info.P[2], depth_info.P[6]
 
-            bbox_poses = PoseArray(header=depth_msg.header)  # TODO: Change frame_id and translate by tf
-            segm_poses = PoseArray(header=depth_msg.header)  # TODO: Change frame_id and translate by tf
+            # Publish in the frame of depth_msg.header.frame_id
+            # [Class Name][Origin] to PoseArray lookup
+            poses_header = depth_msg.header
+            poses = defaultdict(lambda: defaultdict(lambda: PoseArray(header=poses_header)))
+            tagged_bbox_poses = TaggedPoseStampedArray(header=poses_header)
+            tagged_segm_poses = TaggedPoseStampedArray(header=poses_header)
+            tagged_real_poses = PoseArray(header=poses_header)
 
-            def _get_pose(depth_roi, valid_positions, x_offset, y_offset, _fx, _fy, _cx, _cy):
-                zp = depth_roi[valid_positions] / 1000.0
-                yp = ((valid_positions[0] + y_offset) - _cy) * zp / _fy
-                xp = ((valid_positions[1] + x_offset) - _cx) * zp / _fx
-                return Pose(position=Point(np.median(xp), np.median(yp), np.median(zp)))
+            for i in range(len(results.objects)):
+                label = results.objects[i].class_name
 
-            for detection in detections:
-                # TODO: Transform by TF and intrinsics
                 # Get localisation from bbox
-                bbox = detection.roi
-                xv, yv = np.meshgrid(np.arange(int(bbox.x1), int(bbox.x2)), np.arange(int(bbox.y1), int(bbox.y2)))
+                roi = results.objects[i].roi
+                xv, yv = np.meshgrid(np.arange(int(roi.x1), int(roi.x2)), np.arange(int(roi.y1), int(roi.y2)))
                 d_roi = depth_image[yv, xv]  # For bbox the x, y, z pos is based on median of valid depth pixels
                 valid_idx = np.where(np.logical_and(d_roi != 0, np.isfinite(d_roi)))
                 if len(valid_idx[0]) and len(valid_idx[1]):
-                    bbox_poses.poses.append(_get_pose(d_roi, valid_idx, bbox.x1, bbox.y1, fx, fy, cx, cy))
+                    box_pose = self._get_pose(d_roi, valid_idx, roi.x1, roi.y1, fx, fy, cx, cy)
+                    results.objects[i].pose = box_pose
+                    results.objects[i].pose_frame_id = depth_msg.header.frame_id
+
+                    tagged_bbox_poses.poses.append(TaggedPose(tag=label, pose=box_pose))
+                    poses[label]["bbox"].poses.append(box_pose)
+                if self.visualisation_enabled:
+                    boxes_depth_image[yv, xv] = depth_image[yv, xv]  # Publish a bbox pixels only image
 
                 # Get localisation from segm
-                segm = detection.seg_roi
-                if segm.x and segm.y:
-                    xv, yv = np.meshgrid(segm.x, segm.y)
+                segm = results.objects[i].seg_roi
 
-                    d_roi = depth_image[yv, xv]  # For segm the x,y,z pos is based on median of detected pixels
-                    valid_idx = np.where(np.logical_and(d_roi != 0, np.isfinite(d_roi)))
-                    if len(valid_idx[0]) and len(valid_idx[1]):
-                        segm_poses.poses.append(_get_pose(d_roi, valid_idx, bbox.x1, bbox.y1, fx, fy, cx, cy))
+                if not (segm.x and segm.y):
+                    continue
 
-            # Publish pose arrays
+                d_roi = depth_image[segm.y, segm.x]  # For segm the x,y,z pos is based on median of detected pixels
+                valid_idx = np.where(np.logical_and(d_roi != 0, np.isfinite(d_roi)))
+                if len(valid_idx[0]):
+                    zp = d_roi[valid_idx[0]] / 1000.0
+                    yp = (np.asarray(segm.y)[valid_idx[0]] - cy) * zp / fy
+                    xp = (np.asarray(segm.x)[valid_idx[0]] - cx) * zp / fx
+                    segm_pose = Pose(position=Point(np.median(xp), np.median(yp), np.median(zp)), orientation=Quaternion(0, 0, 0, 1))
+                    tagged_segm_poses.poses.append(TaggedPose(tag=label, pose=segm_pose))
+                    poses[label]["segm"].poses.append(segm_pose)
+
+            # Publish depth poses and 1:1 depth map
+            self._publish_poses(poses, tagged_bbox_poses, tagged_segm_poses)
             self.depth_pub.publish(depth_msg)
             self.depth_info_pub.publish(depth_info)
-            self.depth_bbox_detections_pub.publish(bbox_poses)
-            self.depth_segm_detections_pub.publish(segm_poses)
+
+            if self.visualisation_enabled:
+                # Publish bbox points only depth map
+                box_depth_msg = ros_numpy.msgify(Image, boxes_depth_image, encoding="16UC1")
+                box_depth_msg.header = depth_msg.header
+                self.box_depth_pub.publish(box_depth_msg)
+                self.box_depth_info_pub.publish(depth_info)
 
         # Publish detection results
-        self.detections_pub.publish(result.detections)
+        self.detection_results_pub.publish(results)
+
+        # Republish colour images
         self.image_pub.publish(image_msg)
         self.image_info_pub.publish(image_info)
 
         # Offload the visualisation task <1ms (takes considerable time)
-        if self.vis:
-            self.publisher_tasks.add_task(self._vis_publish, (image_msg, result,))
+        if self.visualisation_enabled:
+            self.publisher_tasks.add_task(self._vis_publish, (image_msg, results,))
 
     @function_timer.interval_logger(interval=10)
     def _vis_publish(self, image_msg, result):
@@ -165,16 +239,12 @@ class RunClientOnTopic:
             depth_info (CameraInfo):  The depth camera info message
             result (GetDetectorResultsResponse):  The result of a call to the GetDetectorResults service api
         """
-        from timeit import default_timer as timer
-        s = timer()
         vis = Visualiser(ros_numpy.numpify(image_msg))
         vis.draw_detections_message(result)
-        vis_image = vis.get_image(overlay_alpha=1.0)
-        vis_msg = ros_numpy.msgify(Image, vis_image, encoding="bgr8")
+        vis_image = vis.get_image(overlay_alpha=0.5)
+        vis_msg = ros_numpy.msgify(Image, vis_image, encoding=image_msg.encoding)
         vis_msg.header = image_msg.header
         self.detections_vis_pub.publish(vis_msg)
-        es = timer()
-        # print(es - s)
 
 
     def _get_test_messages(self, max_y, max_x, n_grid=2, box_height=200, box_width=200):
@@ -195,13 +265,7 @@ class RunClientOnTopic:
                 x = max_x * (j / n_grid) + margin
                 roi = RegionOfInterest(x1=x, x2=x + box_width, y1=y, y2=y + box_height)
                 seg_roi = SegmentOfInterest(x=range(int(roi.x1), int(roi.x2)), y=range(int(roi.y1), int(roi.y2)))
-                detections.append(
-                    Detection(
-                        info=DetectionInfo(score=np.random.uniform(), class_id=-1, class_name="test"),
-                        roi=roi,
-                        seg_roi=seg_roi
-                    )
-                )
+                detections.append(Detection(confidence=np.random.uniform(), class_name="test", roi=roi, seg_roi=seg_roi))
         return detections
 
 
@@ -211,8 +275,8 @@ def _get_detections_for_topic():
     rospy.init_node(_node_name, anonymous=True)
 
     # get private namespace parameters
-    p_image_ns = rospy.get_param('~image_ns', "/pico_zense/colour")
-    p_depth_ns = rospy.get_param('~depth_ns', "/pico_zense/aligned_depth_to_colour")
+    p_image_ns = rospy.get_param('~image_ns', "/sequence_0/colour")
+    p_depth_ns = rospy.get_param('~depth_ns', "/sequence_0/depth")
     p_score = rospy.get_param('~score', 0.5)
     p_vis = rospy.get_param('~show_vis', True)
 
@@ -221,8 +285,8 @@ def _get_detections_for_topic():
     ))
 
     # TODO: Re-implement depth for now leave as None
-    detector = RunClientOnTopic(image_namespace=p_image_ns, depth_namespace=p_depth_ns, score_thresh=p_score, vis=p_vis,
-                                service_name=service_name)
+    detector = RunClientOnTopic(image_namespace=p_image_ns, depth_namespace=p_depth_ns, score_thresh=p_score,
+                                visualisation_enabled=p_vis, service_name=service_name)
     rospy.spin()
 
 
