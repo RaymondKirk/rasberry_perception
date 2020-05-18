@@ -1,7 +1,8 @@
 <launch>
     <arg name="backend" default=""/>
+    <arg name="password" default=""/>
     <group if="$(eval arg('backend') != '')">
-        <node pkg="rasberry_perception" name="rasberry_perception_detection_backend" type="run_backend.sh" args="$(arg backend)" output="screen" required="true"/>
+        <node pkg="rasberry_perception" name="rasberry_perception_detection_backend" type="run_backend.sh" args="$(arg backend) $(arg password)" output="screen" required="true"/>
     </group>
 
     <arg name="image_ns" default="/camera/color"/>
