@@ -20,26 +20,28 @@ from rasberry_perception import Client, default_service_name
 from rasberry_perception.utility import function_timer, WorkerTaskQueue
 from rasberry_perception.visualisation import Visualiser
 from rasberry_perception.msg import Detections, Detection, RegionOfInterest, SegmentOfInterest, TaggedPoseStampedArray,\
-    TaggedPose
+    TaggedPose, ObjectSize
 
 
 class RunClientOnTopic:
     def __init__(self, image_namespace, depth_namespace=None, score_thresh=0.5, service_name=default_service_name,
-                 visualisation_enabled=False):
+                 visualisation_enabled=False, publish_source=False):
         # Initialise class members
         self.score_thresh = score_thresh
         self._service_name = service_name
         self.namespace = "rasberry_perception/"
         self.depth_enabled = depth_namespace is not None
         self.visualisation_enabled = visualisation_enabled
+        self.publish_source = publish_source
 
         # Wait for connection to detection service
         self.detector = Client()
 
         # Initialise colour publishers/subscribers
-        # These topics will republish the colour image (to ensure a 1:1 detection/source lookup)
-        self.image_pub = rospy.Publisher(self.namespace + "colour/image_raw", Image, queue_size=1)
-        self.image_info_pub = rospy.Publisher(self.namespace + "colour/camera_info", CameraInfo, queue_size=1)
+        if self.publish_source:
+            # These topics will republish the colour image (to ensure a 1:1 detection/source lookup)
+            self.image_pub = rospy.Publisher(self.namespace + "colour/image_raw", Image, queue_size=1)
+            self.image_info_pub = rospy.Publisher(self.namespace + "colour/camera_info", CameraInfo, queue_size=1)
 
         subscribers = [
             message_filters.Subscriber(image_namespace + "/image_raw", Image),
@@ -52,9 +54,10 @@ class RunClientOnTopic:
         # Initialise depth publishers/subscribers
         self.all_pose_publishers = {}
         if self.depth_enabled:
-            # These topics will republish the depth image (to ensure a 1:1 detection/source lookup)
-            self.depth_pub = rospy.Publisher(self.namespace + "depth/image_raw", Image, queue_size=1)
-            self.depth_info_pub = rospy.Publisher(self.namespace + "depth/camera_info", CameraInfo, queue_size=1)
+            if self.publish_source:
+                # These topics will republish the depth image (to ensure a 1:1 detection/source lookup)
+                self.depth_pub = rospy.Publisher(self.namespace + "depth/image_raw", Image, queue_size=1)
+                self.depth_info_pub = rospy.Publisher(self.namespace + "depth/camera_info", CameraInfo, queue_size=1)
 
             # Container for /detection/<class name>/bbox_poses and /detection/<class name>/segm_poses messages
             self.depth_pose_publishers = {}
@@ -139,12 +142,30 @@ class RunClientOnTopic:
             self.all_pose_publishers[frame_id].publish(pose_array)
 
     @staticmethod
-    def _get_pose(depth_roi, valid_positions, x_offset, y_offset, _fx, _fy, _cx, _cy):
+    def _reject_outliers(data, m=2., method="median"):
+        if not data.size or not data.all():
+            return data
+        if method == "std":
+            return data[abs(data - np.mean(data)) < m * np.std(data)]
+        elif method == "median":
+            d = np.abs(data - np.median(data))
+            m_dev = np.median(d)
+            s = d / (m_dev if m_dev else 1.)
+            return data[s < m]
+        else:
+            raise ValueError("Method must be std or median")
+
+    @staticmethod
+    def _get_pose(depth_roi, valid_positions, x_offset, y_offset, _fx, _fy, _cx, _cy, return_size=False):
         """Utility function to get a pose from a set of (y, x) points within a depth map"""
         zp = depth_roi[valid_positions] / 1000.0
         yp = ((valid_positions[0] + y_offset) - _cy) * zp / _fy
         xp = ((valid_positions[1] + x_offset) - _cx) * zp / _fx
-        return Pose(position=Point(np.median(xp), np.median(yp), np.median(zp)), orientation=Quaternion(0, 0, 0, 1))
+        ret = Pose(position=Point(np.median(xp), np.median(yp), np.median(zp)), orientation=Quaternion(0, 0, 0, 1))
+        if return_size:
+            w, h, d = [np.ptp(RunClientOnTopic._reject_outliers(da)) for da in [xp, yp, zp]]
+            ret = (ret, ObjectSize(w, h, d))
+        return ret
 
     @staticmethod
     def __check_pose_empty(p):
@@ -164,7 +185,9 @@ class RunClientOnTopic:
         # Filter detections by the score
         results = response.results
         results.objects = [d for d in response.results.objects if d.confidence >= self.score_thresh]
-        results.camera_frame = image_msg  # TODO: Is it safe to assume the detection server won't add weird things here?
+        if self.publish_source:
+            # TODO: Is it safe to assume the detection server won't add weird things here?
+            results.camera_frame = image_msg
         results.camera_info = image_info
         # TODO: Is it safe to assume if all tracks have id==0 then they're not tracks?
         if len(results.objects) > 1 and all([d.track_id == 0 for d in results.objects]):
@@ -204,8 +227,9 @@ class RunClientOnTopic:
                 if len(valid_idx[0]) and len(valid_idx[1]):
                     box_pose = results.objects[i].pose
                     if infer_pose_from_depth:
-                        box_pose = self._get_pose(d_roi, valid_idx, roi.x1, roi.y1, fx, fy, cx, cy)
+                        box_pose, size = self._get_pose(d_roi, valid_idx, roi.x1, roi.y1, fx, fy, cx, cy, True)
                         results.objects[i].pose = box_pose
+                        results.objects[i].size = size
                         results.objects[i].pose_frame_id = depth_msg.header.frame_id
                     tagged_bbox_poses.poses.append(TaggedPose(tag=label, pose=box_pose))
                     poses[label]["bbox"].poses.append(box_pose)
@@ -226,6 +250,10 @@ class RunClientOnTopic:
                     xp = (np.asarray(segm.x)[valid_idx[0]] - cx) * zp / fx
                     segm_pose = Pose(position=Point(np.median(xp), np.median(yp), np.median(zp)),
                                      orientation=Quaternion(0, 0, 0, 1))
+                    # Overwrite the bbox extracted size if segm available
+                    results.objects[i].size = ObjectSize(*[
+                        np.ptp(RunClientOnTopic._reject_outliers(da)) for da in [xp, yp, zp]
+                    ])
                     tagged_segm_poses.poses.append(TaggedPose(tag=label, pose=segm_pose))
                     poses[label]["segm"].poses.append(segm_pose)
                     if infer_pose_from_depth:
@@ -234,8 +262,9 @@ class RunClientOnTopic:
                 poses[label]["pose"].poses.append(results.objects[i].pose)
             # Publish depth poses and 1:1 depth map
             self._publish_poses(poses, tagged_bbox_poses, tagged_segm_poses)
-            self.depth_pub.publish(depth_msg)
-            self.depth_info_pub.publish(depth_info)
+            if self.publish_source:
+                self.depth_pub.publish(depth_msg)
+                self.depth_info_pub.publish(depth_info)
 
             if self.visualisation_enabled:
                 # Publish bbox points only depth map
@@ -248,8 +277,9 @@ class RunClientOnTopic:
         self.detection_results_pub.publish(results)
 
         # Republish colour images
-        self.image_pub.publish(image_msg)
-        self.image_info_pub.publish(image_info)
+        if self.publish_source:
+            self.image_pub.publish(image_msg)
+            self.image_info_pub.publish(image_info)
 
         # Offload the visualisation task <1ms (takes considerable time)
         if self.visualisation_enabled:
@@ -277,28 +307,6 @@ class RunClientOnTopic:
         self.detections_vis_info_pub.publish(vis_info)
 
 
-    def _get_test_messages(self, max_y, max_x, n_grid=2, box_height=200, box_width=200):
-        """Internal use only. Returns a list of fake detections
-
-        Args:
-            max_y (int): Max y position (height) of the bounding boxes
-            max_x (int): Max x position (width) of the bounding boxes
-        """
-        detections = []
-        margin = 20
-        max_y -= box_height + (margin * 2)
-        max_x -= box_width + (margin * 2)
-
-        for i in range(n_grid + 1):
-            y = max_y * (i / n_grid) + margin
-            for j in range(n_grid + 1):
-                x = max_x * (j / n_grid) + margin
-                roi = RegionOfInterest(x1=x, x2=x + box_width, y1=y, y2=y + box_height)
-                seg_roi = SegmentOfInterest(x=range(int(roi.x1), int(roi.x2)), y=range(int(roi.y1), int(roi.y2)))
-                detections.append(Detection(confidence=np.random.uniform(), class_name="test", roi=roi, seg_roi=seg_roi))
-        return detections
-
-
 def _get_detections_for_topic():
     service_name = default_service_name
     _node_name = service_name + "_client"
@@ -308,15 +316,19 @@ def _get_detections_for_topic():
     p_image_ns = rospy.get_param('~image_ns', "/sequence_0/colour")
     p_depth_ns = rospy.get_param('~depth_ns', "/sequence_0/depth")
     p_score = rospy.get_param('~score', 0.5)
-    p_vis = rospy.get_param('~show_vis', True)
+    p_vis = rospy.get_param('~show_vis', False)
+    p_source = rospy.get_param('~publish_source', False)
 
-    rospy.loginfo("Camera Topic to Detection ROS: image_namespace={}, depth_namespace={}, score_thresh={}".format(
-        p_image_ns, p_depth_ns, p_score
-    ))
+    rospy.loginfo("Camera Topic to Detection ROS: image_namespace={}, depth_namespace={}, score_thresh={}, "
+                  "visualisation_enabled={}, publish_source={}".format(p_image_ns, p_depth_ns, p_score, p_vis,
+                                                                       p_source))
 
-    detector = RunClientOnTopic(image_namespace=p_image_ns, depth_namespace=p_depth_ns, score_thresh=p_score,
-                                visualisation_enabled=p_vis, service_name=service_name)
-    rospy.spin()
+    try:
+        detector = RunClientOnTopic(image_namespace=p_image_ns, depth_namespace=p_depth_ns, score_thresh=p_score,
+                                    visualisation_enabled=p_vis, service_name=service_name, publish_source=p_source)
+        rospy.spin()
+    except (KeyboardInterrupt, rospy.ROSInterruptException) as e:
+        print("Exiting node due to interrupt:", e)
 
 
 if __name__ == '__main__':
